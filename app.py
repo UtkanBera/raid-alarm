@@ -1,7 +1,9 @@
 import os
+import sys
 import asyncio
 import threading
 import logging
+import json
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string
 from twilio.rest import Client
@@ -10,6 +12,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 app = Flask(__name__)
 
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
 state = {
     "running": False,
     "connected": False,
@@ -17,9 +22,15 @@ state = {
     "last_alarm": None,
     "error": None,
     "log": [],
+    # FCM pairing
+    "paired": False,
+    "steam_id": os.environ.get("RUSTPLUS_STEAM_ID"),
+    "player_token": os.environ.get("RUSTPLUS_PLAYER_TOKEN"),
+    "pairing_url": None,
 }
 
-_thread = None
+_rust_thread = None
+_fcm_thread = None
 
 
 # ---------------------------------------------------------------------------
@@ -37,20 +48,16 @@ def add_log(msg, level="info"):
 
 
 def make_call():
-    """Twilio ile telefon araması yap."""
     try:
-        client = Client(
-            os.environ["TWILIO_SID"],
-            os.environ["TWILIO_TOKEN"],
-        )
+        client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_TOKEN"])
         twiml = (
             "<Response>"
             "<Say language='tr-TR' voice='alice'>"
-            "Dikkat! Rust oyununda raid alarmı! Sismik sensör tetiklendi!"
+            "Dikkat! Rust oyununda raid alarmi! Sismik sensor tetiklendi!"
             "</Say>"
             "<Pause length='1'/>"
             "<Say language='tr-TR' voice='alice'>"
-            "Dikkat! Raid alarmı! Dikkat! Raid alarmı!"
+            "Dikkat! Raid alarmi! Dikkat! Raid alarmi!"
             "</Say>"
             "</Response>"
         )
@@ -59,23 +66,92 @@ def make_call():
             to=os.environ["TWILIO_TO"],
             from_=os.environ["TWILIO_FROM"],
         )
-        add_log(f"Arama başlatıldı: {call.sid}")
+        add_log(f"Arama baslatildi: {call.sid}")
     except Exception as exc:
-        add_log(f"Twilio hatası: {exc}", "error")
+        add_log(f"Twilio hatasi: {exc}", "error")
 
 
 # ---------------------------------------------------------------------------
-# Rust+ listener (async, ayrı thread'de çalışır)
+# FCM Listener — pairing bildirimi bekler, steamId + playerToken alır
+# ---------------------------------------------------------------------------
+
+def _start_fcm_listener():
+    android_id     = os.environ.get("FCM_ANDROID_ID")
+    security_token = os.environ.get("FCM_SECURITY_TOKEN")
+    fcm_token      = os.environ.get("FCM_TOKEN")
+
+    if not all([android_id, security_token, fcm_token]):
+        add_log("FCM credentials eksik, listener baslatilmadi.", "error")
+        return
+
+    # Pairing URL'sini state'e yaz
+    state["pairing_url"] = (
+        f"https://companion-rust.facepunch.com/api/push/link?fcm_token={fcm_token}"
+    )
+
+    # Eğer zaten steam_id + player_token varsa listener'a gerek yok
+    if state["steam_id"] and state["player_token"]:
+        state["paired"] = True
+        add_log("Steam ID ve Player Token zaten mevcut, eslestirme atlanıyor.")
+        return
+
+    add_log("FCM dinleyici baslatildi. Eslestirme bekleniyor...")
+
+    try:
+        # push_receiver user site-packages altında
+        sys.path.insert(0, __import__("site").getusersitepackages())
+        from push_receiver.push_receiver import PushReceiver
+
+        credentials = {
+            "gcm": {
+                "androidId": android_id,
+                "securityToken": security_token,
+            }
+        }
+
+        def on_notification(obj, notification, data_message):
+            try:
+                payload = {}
+                if isinstance(notification, dict):
+                    payload.update(notification)
+                if data_message:
+                    for kv in getattr(data_message, "app_data", []):
+                        payload[kv.key] = kv.value
+
+                add_log(f"FCM bildirimi alindi: {list(payload.keys())}")
+
+                steam_id     = payload.get("steamId")     or payload.get("steam_id")
+                player_token = payload.get("playerToken") or payload.get("player_token")
+
+                if steam_id and player_token:
+                    state["steam_id"]     = steam_id
+                    state["player_token"] = player_token
+                    state["paired"]       = True
+                    add_log(f"Eslestirme tamamlandi! Steam ID: {steam_id}", "alarm")
+                    add_log("Artik BASLAT butonuna basabilirsiniz.")
+
+            except Exception as exc:
+                add_log(f"FCM bildirim hatasi: {exc}", "error")
+
+        receiver = PushReceiver(credentials=credentials)
+        receiver.listen(callback=on_notification)  # blocking
+
+    except Exception as exc:
+        add_log(f"FCM listener hatasi: {exc}", "error")
+
+
+# ---------------------------------------------------------------------------
+# Rust+ listener
 # ---------------------------------------------------------------------------
 
 async def rust_listener():
-    from rustplus import RustSocket, EntityEvent  # noqa: import burada — Railway ortamında
+    from rustplus import RustSocket, EntityEvent
 
-    ip = os.environ["RUSTPLUS_SERVER_IP"]
-    port = int(os.environ["RUSTPLUS_SERVER_PORT"])
-    steam_id = int(os.environ["RUSTPLUS_STEAM_ID"])
-    player_token = int(os.environ["RUSTPLUS_PLAYER_TOKEN"])
-    entity_id = int(os.environ["RUSTPLUS_ENTITY_ID"])
+    ip           = os.environ["RUSTPLUS_SERVER_IP"]
+    port         = int(os.environ["RUSTPLUS_SERVER_PORT"])
+    steam_id     = int(state["steam_id"])
+    player_token = int(state["player_token"])
+    entity_id    = int(os.environ["RUSTPLUS_ENTITY_ID"])
 
     while state["running"]:
         socket = None
@@ -87,10 +163,10 @@ async def rust_listener():
                 if event.value:
                     state["alarm_count"] += 1
                     state["last_alarm"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-                    add_log("RAID ALARMI! Sismik sensör tetiklendi!", "alarm")
+                    add_log("RAID ALARMI! Sismik sensor tetiklendi!", "alarm")
                     threading.Thread(target=make_call, daemon=True).start()
                 else:
-                    add_log("Sismik sensör sakinlesti.")
+                    add_log("Sismik sensor sakinlesti.")
 
             await socket.connect()
             state["connected"] = True
@@ -118,7 +194,7 @@ async def rust_listener():
     add_log("Listener durduruldu.")
 
 
-def _run_loop():
+def _run_rust_loop():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -138,14 +214,16 @@ def index():
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
-    global _thread
+    global _rust_thread
+    if not state["steam_id"] or not state["player_token"]:
+        return jsonify({"error": "Once eslestirme yapilmali! Pairing URL'yi kullanin."}), 400
     if not state["running"]:
         state["running"] = True
         state["alarm_count"] = 0
         state["error"] = None
         add_log("Alarm sistemi baslatildi.")
-        _thread = threading.Thread(target=_run_loop, daemon=True)
-        _thread.start()
+        _rust_thread = threading.Thread(target=_run_rust_loop, daemon=True)
+        _rust_thread.start()
     return jsonify(_safe_state())
 
 
@@ -170,17 +248,20 @@ def api_test_call():
 
 def _safe_state():
     return {
-        "running": state["running"],
-        "connected": state["connected"],
-        "alarm_count": state["alarm_count"],
-        "last_alarm": state["last_alarm"],
-        "error": state["error"],
-        "log": state["log"][:30],
+        "running":      state["running"],
+        "connected":    state["connected"],
+        "alarm_count":  state["alarm_count"],
+        "last_alarm":   state["last_alarm"],
+        "error":        state["error"],
+        "paired":       state["paired"],
+        "steam_id":     state["steam_id"],
+        "pairing_url":  state["pairing_url"],
+        "log":          state["log"][:30],
     }
 
 
 # ---------------------------------------------------------------------------
-# HTML arayüzü
+# HTML
 # ---------------------------------------------------------------------------
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -203,11 +284,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .value{font-size:1rem;font-weight:600}
     .alarm-count{font-size:2.5rem;font-weight:700;text-align:center;color:#f0883e;line-height:1}
     .alarm-label{text-align:center;color:#8b949e;font-size:0.8rem;margin-top:4px}
-    .btn{display:block;width:100%;padding:16px;border:none;border-radius:10px;font-size:1.1rem;font-weight:700;cursor:pointer;letter-spacing:1px;transition:opacity .15s}
+    .btn{display:block;width:100%;padding:16px;border:none;border-radius:10px;font-size:1.1rem;font-weight:700;cursor:pointer;letter-spacing:1px;transition:opacity .15s;margin-bottom:10px}
     .btn:active{opacity:.75}
-    .btn-start{background:#238636;color:#fff;margin-bottom:10px}
-    .btn-stop{background:#da3633;color:#fff;margin-bottom:10px}
+    .btn-start{background:#238636;color:#fff}
+    .btn-stop{background:#da3633;color:#fff}
     .btn-test{background:#1f6feb;color:#fff;font-size:.9rem;padding:12px}
+    .btn-pair{background:#6e40c9;color:#fff;font-size:.9rem;padding:12px;text-decoration:none;display:block;text-align:center;border-radius:10px;font-weight:700;margin-bottom:10px}
     .btn:disabled{opacity:.4;cursor:default}
     .log-list{list-style:none;max-height:260px;overflow-y:auto}
     .log-list li{font-size:0.78rem;padding:5px 0;border-bottom:1px solid #21262d;display:flex;gap:8px}
@@ -215,13 +297,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .log-msg.alarm{color:#f85149;font-weight:700}
     .log-msg.error{color:#e3b341}
     .log-msg.info{color:#e6edf3}
+    .pairing-box{background:#161b22;border:1px solid #6e40c9;border-radius:8px;padding:12px;margin-bottom:14px}
+    .pairing-box p{font-size:.82rem;color:#8b949e;margin-bottom:8px}
     .error-box{background:#2d1212;border:1px solid #f8514966;border-radius:8px;padding:10px;font-size:0.82rem;color:#ffa198;margin-top:8px;display:none}
   </style>
 </head>
 <body>
   <h1>&#128680; Raid Alarm</h1>
 
+  <!-- Pairing kutusu — paired olunca gizlenir -->
+  <div class="pairing-box" id="pairing-box" style="display:none">
+    <p>&#128279; Steam hesabını bağlamak için aşağıdaki butona bas:</p>
+    <a id="pair-link" href="#" target="_blank" class="btn-pair">&#128279; Steam ile Eşleştir</a>
+    <p style="font-size:.75rem;color:#6e7681">Giriş yaptıktan sonra Rust oyununda sunucuya bağlan → Rust+ → Pair with Server</p>
+  </div>
+
   <div class="card">
+    <div class="status-row">
+      <div class="dot" id="dot-paired"></div>
+      <span class="label">Eşleştirme:</span>
+      <span class="value" id="txt-paired">—</span>
+    </div>
     <div class="status-row">
       <div class="dot" id="dot-running"></div>
       <span class="label">Sistem:</span>
@@ -242,8 +338,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <button class="btn btn-start" id="btn-start" onclick="doStart()">▶ BAŞLAT</button>
-    <button class="btn btn-stop"  id="btn-stop"  onclick="doStop()">■ DURDUR</button>
+    <button class="btn btn-start" id="btn-start" onclick="doStart()">&#9654; BAŞLAT</button>
+    <button class="btn btn-stop"  id="btn-stop"  onclick="doStop()">&#9632; DURDUR</button>
     <button class="btn btn-test"  id="btn-test"  onclick="doTest()">&#128222; Test Araması Yap</button>
   </div>
 
@@ -253,8 +349,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <script>
-    let _running = false;
-
     async function fetchStatus() {
       try {
         const r = await fetch('/api/status');
@@ -264,7 +358,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function update(d) {
-      _running = d.running;
+      // Pairing kutusu
+      const pbox = document.getElementById('pairing-box');
+      if (!d.paired && d.pairing_url) {
+        pbox.style.display = 'block';
+        document.getElementById('pair-link').href = d.pairing_url;
+      } else {
+        pbox.style.display = 'none';
+      }
+
+      document.getElementById('dot-paired').className = 'dot ' + (d.paired ? 'green' : 'yellow');
+      document.getElementById('txt-paired').textContent = d.paired
+        ? ('Bağlı' + (d.steam_id ? ' (' + d.steam_id + ')' : ''))
+        : 'Eşleştirilmedi';
 
       document.getElementById('dot-running').className = 'dot ' + (d.running ? 'green' : 'red');
       document.getElementById('txt-running').textContent = d.running ? 'Aktif' : 'Durdu';
@@ -287,7 +393,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         ll.appendChild(li);
       });
 
-      document.getElementById('btn-start').disabled = d.running;
+      document.getElementById('btn-start').disabled = d.running || !d.paired;
       document.getElementById('btn-stop').disabled = !d.running;
     }
 
@@ -316,6 +422,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </script>
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# Startup — FCM listener'ı arka planda başlat
+# ---------------------------------------------------------------------------
+
+def _start_background_services():
+    global _fcm_thread
+    _fcm_thread = threading.Thread(target=_start_fcm_listener, daemon=True)
+    _fcm_thread.start()
+
+
+_start_background_services()
 
 
 # ---------------------------------------------------------------------------
