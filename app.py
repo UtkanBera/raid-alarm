@@ -40,8 +40,8 @@ def make_call():
     """Twilio ile telefon araması yap."""
     try:
         client = Client(
-            os.environ["TWILIO_ACCOUNT_SID"],
-            os.environ["TWILIO_AUTH_TOKEN"],
+            os.environ["TWILIO_SID"],
+            os.environ["TWILIO_TOKEN"],
         )
         twiml = (
             "<Response>"
@@ -56,8 +56,8 @@ def make_call():
         )
         call = client.calls.create(
             twiml=twiml,
-            to=os.environ["TWILIO_TO_NUMBER"],
-            from_=os.environ["TWILIO_FROM_NUMBER"],
+            to=os.environ["TWILIO_TO"],
+            from_=os.environ["TWILIO_FROM"],
         )
         add_log(f"Arama başlatıldı: {call.sid}")
     except Exception as exc:
